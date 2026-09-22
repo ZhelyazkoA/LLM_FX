@@ -1,0 +1,4 @@
+# Install with the WINDOWS Python that lives inside your Wine prefix
+# (or a native Windows Python), e.g.:  wine python -m pip install -r requirements.txt
+requests>=2.31
+MetaTrader5>=5.0.45
