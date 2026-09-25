@@ -402,6 +402,15 @@ def _extra_params(prefix: str) -> dict:
         print(f"[!] {prefix}_EXTRA_PARAMS is not valid JSON ({e}) - ignoring.")
     return {}
 
+if os.getenv("LOCALCLOUD_ENABLED", "true").lower() == "true":
+    CLOUD_PROVIDERS.append({
+        "name": "localproxy",
+        "api_key": os.getenv("LOCALCLOUD_API_KEY", "not-needed"),
+        "base_url": os.getenv("LOCALCLOUD_BASE_URL", "http://localhost:11074/v1/chat/completions"),
+        "model": os.getenv("LOCALCLOUD_MODEL", "openai/gpt-oss-20b"),
+        "timeout": int(os.getenv("LOCALCLOUD_TIMEOUT_SEC", str(CFG.cloud_timeout_sec))),
+        "extra_params": _extra_params("LOCALCLOUD"),
+    })
 if os.getenv("GROQ_API_KEY"):
     CLOUD_PROVIDERS.append({
         "name": "groq",

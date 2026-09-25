@@ -4,6 +4,10 @@ Versions are tracked here (and via git tags/releases), not in filenames. The
 running version is available as `__version__` in `claude_bot.py`, is printed
 at daemon startup, and is stamped on every order's `comment` field.
 
+## 9.1 
+Added local openai compatible gateway for LLM
+New parameters for using are in .env file
+
 ## 9.0
 
 - **Renamed** `claude_v8.py` → `claude_bot.py`, `claude_bot_v8.sh` → `claude_bot.sh`. No version suffix on filenames going forward — see the note above on how to check the running version.
