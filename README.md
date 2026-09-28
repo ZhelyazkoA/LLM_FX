@@ -1,8 +1,8 @@
 # LLM_Bot_FX
 
-**Current version: 9.0** — see [`CHANGELOG.md`](CHANGELOG.md) for history. Filenames no longer carry a version suffix; the running version is tracked via `__version__` in `claude_bot.py`, printed at startup, and stamped on every order's comment field. Use git tags/releases to pin a specific version.
+**Current version: 9.2** — see [`CHANGELOG.md`](CHANGELOG.md) for history. Filenames no longer carry a version suffix; the running version is tracked via `__version__` in `claude_bot.py`, printed at startup, and stamped on every order's comment field. Use git tags/releases to pin a specific version.
 
-An experimental MetaTrader 5 trading daemon where a **local LLM (via Ollama)** proposes a trade *direction and conviction*, and **deterministic code** does everything that can lose money: position sizing, stop placement, spread filtering, trailing stops and the daily loss circuit breaker. Low-confidence local answers can optionally be escalated to a cloud LLM (Groq, Cerebras, OpenRouter) for a second opinion.
+An experimental MetaTrader 5 trading daemon where an **LLM** proposes a trade *direction and conviction*, and **deterministic code** does everything that can lose money: position sizing, stop placement, spread filtering, trailing stops and the daily loss circuit breaker. Every model call — local or cloud — goes through a single gateway, **llmspy** (an OpenAI-chat-completions-compatible proxy in front of Ollama and any cloud backends), configured as an ordered chain of model names (`LLMSPY_MODELS`). A low-confidence answer from the first model in the chain is escalated to the next one, in order, for a second opinion.
 
 > **Disclaimer — read this first.**
 > This is research/hobby software, **not financial advice**. A small local LLM has no demonstrated statistical edge on raw price data, and nothing here has been backtested. Run it with `DRY_RUN=true`, then on a **demo account**, and treat every parameter as something to validate rather than trust. You are solely responsible for any losses. The software is provided as-is, with no warranty.
@@ -16,11 +16,11 @@ The model only ever answers `{"reasoning", "action": BUY|SELL|HOLD, "confidence"
 ```mermaid
 flowchart TD
     A[New candle opens] --> B[Fetch closed candles<br/>EMA9/21, RSI14, ATR14, spread, HTF bias]
-    B --> C[Local Ollama model<br/>JSON-schema constrained]
+    B --> C[llmspy gateway - tier 0<br/>LLMSPY_MODELS first entry]
     C -->|confidence >= threshold| F
-    C -->|confidence < threshold| D[Cloud providers, in order:<br/>Groq → Cerebras → OpenRouter]
+    C -->|confidence < threshold| D[llmspy gateway - remaining tiers,<br/>in LLMSPY_MODELS order]
     D -->|first valid answer wins| F
-    D -->|all fail| F[Final signal<br/>falls back to local answer]
+    D -->|all fail| F[Final signal<br/>falls back to tier-0 answer]
     F --> G{Filters}
     G -->|HOLD / below MIN_CONFIDENCE /<br/>position cap / spread too wide /<br/>circuit breaker| X[No trade - logged]
     G -->|pass| H[ATR-based SL/TP + lot sizing<br/>→ order_send]
@@ -57,8 +57,8 @@ Higher-timeframe bias (EMA20 vs EMA50 + last close): M1–M30 → H1, H1 → H4,
 
 - MetaTrader 5 terminal, **logged in, with Algo/Auto Trading enabled**
 - Python for **Windows** with the `MetaTrader5` package. On Linux, run both MT5 and that Python inside a Wine prefix (this project's launcher does `wine python …`)
-- A reachable [Ollama](https://ollama.com) server with a model pulled (small instruct models such as `phi4-mini` or `qwen2.5:3b` work; JSON-schema output requires a reasonably recent Ollama)
-- Optional: API keys for Groq / Cerebras / OpenRouter (free tiers exist)
+- A reachable **llmspy** gateway exposing an OpenAI-chat-completions-compatible endpoint (`.../v1/chat/completions`), fronting a local Ollama instance and/or cloud backends. This bot only ever calls llmspy directly — it holds no cloud API keys and never talks to Ollama's native API.
+- Whatever llmspy needs on its own side to serve the model names you put in `LLMSPY_MODELS` (e.g. an Ollama instance with those models pulled, and/or cloud credentials configured in llmspy itself)
 
 ## Quick start
 
@@ -71,7 +71,7 @@ wine python -m pip install -r requirements.txt
 # 2. Configure
 cp .env.example .env
 chmod 600 .env
-$EDITOR .env          # set TRUENAS_IP / OLLAMA_PORT, symbol, timeframe, keys...
+$EDITOR .env          # set LLMSPY_BASE_URL, LLMSPY_MODELS, symbol, timeframe...
 
 # 3. Launch (DRY_RUN=true by default: nothing is sent to the broker)
 chmod +x claude_bot.sh
@@ -96,19 +96,20 @@ All settings are environment variables, normally set in `.env` (see [`.env.examp
 | Group | Variables |
 |-------|-----------|
 | Safety | `DRY_RUN` (default `true`), `FIXED_LOT_SIZE`, `MAX_POSITIONS_PER_DIRECTION`, `MIN_CONFIDENCE`, `DAILY_LOSS_LIMIT_PCT`, `MAGIC_NUMBER` |
-| Ollama | `TRUENAS_IP`, `OLLAMA_PORT`, `OLLAMA_MODEL`, `OLLAMA_NUM_THREAD`, `OLLAMA_NUM_CTX`, `OLLAMA_NUM_PREDICT`, `LLM_MAX_LATENCY_SEC` |
+| llmspy gateway | `LLMSPY_BASE_URL`, `LLMSPY_MODELS`, `LLMSPY_MAX_TOKENS`, `KEEP_LOCAL_ALIVE`, `LLM_MAX_LATENCY_SEC` |
 | Market | `TRADE_SYMBOL`, `TRADE_TIMEFRAME`, `LOOKBACK_CANDLES` (≥ 22), `PROMPT_BARS`, `BROKER_UTC_OFFSET_HOURS` |
 | Risk sizing | `STARTING_RISK_PCT`, `MAX_RISK_PCT`, `RISK_STEP_PCT` |
 | Stops | `ATR_SL_MULTIPLIER`, `ATR_TP_MULTIPLIER`, `EXTENDED_TP_ATR_MULT`, `MAX_TP_EXTENSION_ATR_MULT`, `TRAIL_ACTIVATION_ATR_MULT`, `CHANDELIER_ATR_MULT` |
-| Escalation | `ESCALATION_ENABLED`, `ESCALATION_CONFIDENCE_THRESHOLD`, `ESCALATION_SHARE_LOCAL_ANSWER`, `CLOUD_TIMEOUT_SEC` |
-| Providers | `GROQ_*`, `CEREBRAS_*`, `OPENROUTER_*` — each with `_API_KEY`, `_MODEL`, `_BASE_URL`, `_TIMEOUT_SEC`, `_EXTRA_PARAMS` (JSON) |
+| Escalation | `ESCALATION_ENABLED`, `ESCALATION_CONFIDENCE_THRESHOLD`, `ESCALATION_SHARE_LOCAL_ANSWER`, `LLMSPY_TIMEOUT_SEC` |
 
 Notes:
 
-- `TRUENAS_IP` is just the hostname/IP of whatever machine runs Ollama (the name is historical).
-- Any OpenAI-chat-completions-compatible provider can be added: append another entry to `CLOUD_PROVIDERS` in `claude_bot.py` (an example is in the comments there).
-- Reasoning ("thinking") models are supported — `<think>…</think>` blocks are stripped — but they can be slow. Use `<NAME>_EXTRA_PARAMS` (e.g. `{"reasoning_effort": "low"}` for Groq) and a generous `<NAME>_TIMEOUT_SEC`.
-- **Two thresholds interact:** `ESCALATION_CONFIDENCE_THRESHOLD` decides *whether to ask the cloud*; `MIN_CONFIDENCE` decides *whether the final answer trades*.
+- `LLMSPY_MODELS` is an ordered, comma-separated list of model names — tier 0 first, e.g. `phi4-mini,gpt-oss-20b`. There's no separate "local" vs "cloud" config anymore: llmspy alone decides what each name resolves to. Add a third/fourth tier just by adding another name to the list.
+- `KEEP_LOCAL_ALIVE` (minutes) is only sent on the tier-0 call, as Ollama's `keep_alive` field — it's meaningless for later (presumably cloud) tiers and is never sent for them.
+- `LLMSPY_MAX_TOKENS` maps to the standard `max_tokens` chat-completions field. `num_ctx`/`num_thread` are **not** configurable from this bot — llmspy's chat-completions endpoint doesn't forward a nested Ollama `options` object, so those must be set on the llmspy/Ollama side directly.
+- Reasoning ("thinking") models are supported — `<think>…</think>` blocks are stripped from any tier's answer.
+- **Two thresholds interact:** `ESCALATION_CONFIDENCE_THRESHOLD` decides *whether to escalate to the next tier*; `MIN_CONFIDENCE` decides *whether the final answer (whichever tier it came from) trades*.
+- `LLMSPY_TIMEOUT_SEC` bounds each individual call in the chain; the whole chain for one candle is additionally bounded by the per-timeframe `LLM_MAX_LATENCY_SEC` budget below, so a chain of slow tiers can't blow past the timeframe's decision budget.
 - Changing `MAGIC_NUMBER` while positions are open orphans them: the bot only manages positions carrying its own magic number. **If you're upgrading from a build using magic number `260921`:** either close those positions first, or set `MAGIC_NUMBER=260921` until they're closed, then switch to the new default (`260922`).
 
 ## Files the bot writes
@@ -129,7 +130,8 @@ All four are git-ignored.
 | `Order Send Failed (terminal-level, no result object)` | AutoTrading/Algo Trading disabled in the MT5 terminal, or the terminal isn't connected/logged in |
 | Every signal is `HOLD` | `LOOKBACK_CANDLES` < 22, wrong `TRADE_SYMBOL` spelling, or the LLM is timing out (see the log) |
 | Nothing is ever sent | `DRY_RUN` is still `true` (the default) |
-| Escalation never happens | No API key set, `ESCALATION_ENABLED=false`, or local confidence is always ≥ the threshold |
+| Escalation never happens | `LLMSPY_MODELS` has only one entry, `ESCALATION_ENABLED=false`, or tier-0 confidence is always ≥ the threshold |
+| Signal always fails/HOLD with an escalation error | `LLMSPY_BASE_URL` unreachable, or a model name in `LLMSPY_MODELS` isn't one llmspy actually serves — check `claude_bot.log` for the HTTP error from llmspy |
 | `Insufficient free margin` / lot = 0 | Account too small for the risk settings; check `FIXED_LOT_SIZE` / risk % |
 | Garbled characters / crash on log output under Wine | Make sure `PYTHONUTF8=1` (the launcher sets it) |
 
@@ -143,8 +145,9 @@ All four are git-ignored.
 
 ## Security
 
-- API keys belong in `.env` (git-ignored, `chmod 600`) or your shell environment — never in tracked files.
-- If a key was ever committed, **rotate it**; deleting the file doesn't remove it from git history.
+- As of v9.2, this bot holds no cloud API keys at all — every model call goes through llmspy, which is the only thing that authenticates outward. Any credentials llmspy itself needs for its cloud backends live in llmspy's own configuration, not here.
+- `.env` (git-ignored, `chmod 600`) is still where `LLMSPY_BASE_URL` and any other locally-sensitive values (e.g. an internal-only hostname) belong — never in tracked files.
+- If a secret was ever committed in an earlier version, **rotate it**; deleting the file doesn't remove it from git history.
 
 ## Project layout
 

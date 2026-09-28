@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# Claude Trading Daemon - launch script (v9.0, Chandelier Exit trailing stop)
+# Claude Trading Daemon - launch script (v9.2, llmspy gateway)
 # ============================================================
 # Configuration lives in a local `.env` file (copy .env.example -> .env and
 # edit). Every variable below can also be provided by the calling
@@ -52,10 +52,9 @@ load_dotenv() {
 [ -f .env ] && load_dotenv .env
 
 # --- Defaults (only applied if not set by the environment / .env) ---------
-# MT5 / Ollama connection
-export TRUENAS_IP="${TRUENAS_IP:-localhost}"          # host running Ollama
-export OLLAMA_PORT="${OLLAMA_PORT:-11434}"            # Ollama's default port
-# OLLAMA_MODEL: leave unset to auto-detect (running model -> first installed -> qwen2.5:3b)
+# llmspy gateway (single OpenAI-chat-completions endpoint for every tier,
+# local and cloud alike - no personal hostname defaulted here, set it in .env)
+export LLMSPY_BASE_URL="${LLMSPY_BASE_URL:-http://localhost:8000/v1/chat/completions}"
 
 # Instrument & timeframe
 export TRADE_SYMBOL="${TRADE_SYMBOL:-EURUSD}"         # exactly as your broker lists it
@@ -77,10 +76,11 @@ export DAILY_LOSS_LIMIT_PCT="${DAILY_LOSS_LIMIT_PCT:-3.0}"
 export LOOKBACK_CANDLES="${LOOKBACK_CANDLES:-50}"     # must stay >= 22
 export PROMPT_BARS="${PROMPT_BARS:-3}"
 
-# Ollama inference tuning
-export OLLAMA_NUM_THREAD="${OLLAMA_NUM_THREAD:-3}"
-export OLLAMA_NUM_CTX="${OLLAMA_NUM_CTX:-2048}"
-export OLLAMA_NUM_PREDICT="${OLLAMA_NUM_PREDICT:-128}"
+# Generation limits (num_ctx/num_thread are NOT settable here - llmspy
+# doesn't forward Ollama's nested "options" object; configure those on the
+# llmspy/Ollama side directly)
+export LLMSPY_MAX_TOKENS="${LLMSPY_MAX_TOKENS:-128}"
+export KEEP_LOCAL_ALIVE="${KEEP_LOCAL_ALIVE:-0}"         # minutes; 0 = Ollama's own default (~5m)
 export LLM_MAX_LATENCY_SEC="${LLM_MAX_LATENCY_SEC:-0}"   # 0 = per-timeframe budget table
 
 # Initial SL/TP (ATR multiples, set once at entry)
@@ -93,26 +93,14 @@ export MAX_TP_EXTENSION_ATR_MULT="${MAX_TP_EXTENSION_ATR_MULT:-10.0}"
 export TRAIL_ACTIVATION_ATR_MULT="${TRAIL_ACTIVATION_ATR_MULT:-1.5}"
 export CHANDELIER_ATR_MULT="${CHANDELIER_ATR_MULT:-3.0}"
 
-# Cloud escalation (a provider is only used if its API key is non-empty)
+# Escalation chain - ordered, comma-separated model names, tier 0 first.
+# llmspy decides per-model whether that name is local or cloud; no API keys
+# are needed here anymore, llmspy is the only thing that authenticates outward.
+export LLMSPY_MODELS="${LLMSPY_MODELS:-phi4-mini,gpt-oss-20b}"
 export ESCALATION_ENABLED="${ESCALATION_ENABLED:-true}"
 export ESCALATION_CONFIDENCE_THRESHOLD="${ESCALATION_CONFIDENCE_THRESHOLD:-0.80}"
 export ESCALATION_SHARE_LOCAL_ANSWER="${ESCALATION_SHARE_LOCAL_ANSWER:-false}"
-export CLOUD_TIMEOUT_SEC="${CLOUD_TIMEOUT_SEC:-40}"
-
-export GROQ_MODEL="${GROQ_MODEL:-qwen/qwen3.8-27b}"
-export GROQ_BASE_URL="${GROQ_BASE_URL:-https://api.groq.com/openai/v1/chat/completions}"
-export GROQ_TIMEOUT_SEC="${GROQ_TIMEOUT_SEC:-40}"
-
-export CEREBRAS_MODEL="${CEREBRAS_MODEL:-llama3.1-8b}"
-export CEREBRAS_BASE_URL="${CEREBRAS_BASE_URL:-https://api.cerebras.ai/v1/chat/completions}"
-export CEREBRAS_TIMEOUT_SEC="${CEREBRAS_TIMEOUT_SEC:-20}"
-
-export OPENROUTER_MODEL="${OPENROUTER_MODEL:-meta-llama/llama-3.3-70b-instruct:free}"
-export OPENROUTER_BASE_URL="${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1/chat/completions}"
-export OPENROUTER_TIMEOUT_SEC="${OPENROUTER_TIMEOUT_SEC:-20}"
-
-# API keys (GROQ_API_KEY / CEREBRAS_API_KEY / OPENROUTER_API_KEY) intentionally
-# have no default: set them in .env or export them before running.
+export LLMSPY_TIMEOUT_SEC="${LLMSPY_TIMEOUT_SEC:-40}"    # same timeout applied to every tier call
 
 # Wine / MT5 environment
 export WINEDEBUG="${WINEDEBUG:-fixme-all}"

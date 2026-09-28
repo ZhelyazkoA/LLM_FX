@@ -4,7 +4,60 @@ Versions are tracked here (and via git tags/releases), not in filenames. The
 running version is available as `__version__` in `claude_bot.py`, is printed
 at daemon startup, and is stamped on every order's `comment` field.
 
-## 9.1 
+## 9.2
+
+Replaces the v9.1 local gateway experiment with a single unified gateway
+(**llmspy**) for every model call, local and cloud alike, and generalizes
+escalation from a single local→cloud hop into an ordered N-tier chain.
+
+- **Single gateway, single code path.** `claude_bot.py` no longer speaks
+  Ollama's native `/api/generate` for the local model and a separate
+  OpenAI-chat-completions dialect for cloud providers. Every tier now goes
+  through one call (`call_llmspy_model`) to `LLMSPY_BASE_URL`
+  (`.../v1/chat/completions`); llmspy itself decides whether a given model
+  name resolves to a local (Ollama) or cloud backend.
+- **`CLOUD_PROVIDERS` removed**, along with all Groq/Cerebras/OpenRouter/
+  LocalCloud-specific config (`GROQ_*`, `CEREBRAS_*`, `OPENROUTER_*`,
+  `LOCALCLOUD_*`) and their API keys. This bot no longer holds any cloud
+  credentials at all — llmspy is the only thing that authenticates outward.
+- **Escalation generalized to an ordered chain.** `LLMSPY_MODELS` is now a
+  comma-separated, ordered list of model names (tier 0 first, e.g.
+  `phi4-mini,gpt-oss-20b`). If tier 0's confidence is below
+  `ESCALATION_CONFIDENCE_THRESHOLD`, later tiers are tried in order and the
+  first one to return a valid answer wins (its own confidence isn't
+  re-checked — `MIN_CONFIDENCE` still filters whichever answer is finally
+  used, at trade-execution time). A tier that errors or times out falls
+  through to the next; if every later tier fails, tier 0's answer is kept
+  as the final fallback regardless of its confidence. Adding a third or
+  fourth tier is now just adding another name to `LLMSPY_MODELS` — no code
+  change required.
+- **Per-call timeout unified.** `CLOUD_TIMEOUT_SEC` (used only for cloud
+  providers) is replaced by `LLMSPY_TIMEOUT_SEC`, applied to every tier's
+  call alike. Each individual call is capped at
+  `min(LLMSPY_TIMEOUT_SEC, time remaining in this candle's overall
+  MAX_LLM_LATENCY_SEC budget)`, so a slow chain still can't blow past the
+  per-timeframe decision budget that already existed.
+- **Ollama-native tuning removed.** `OLLAMA_NUM_THREAD`, `OLLAMA_NUM_CTX`,
+  and `OLLAMA_MODEL` auto-detection (via `/api/ps` / `/api/tags`) are gone
+  — confirmed via direct testing that llmspy's chat-completions endpoint
+  does not forward a nested Ollama `options` object, so `num_ctx`/
+  `num_thread` have no effect from this bot and must be configured on the
+  llmspy/Ollama side directly. `OLLAMA_NUM_PREDICT` is replaced by
+  `LLMSPY_MAX_TOKENS`, sent as the standard `max_tokens` field (confirmed
+  to work through llmspy, unlike the nested `options` object).
+- **New: `KEEP_LOCAL_ALIVE`** (minutes) — sent as Ollama's `keep_alive`
+  field, confirmed to pass through llmspy and extend how long Ollama keeps
+  the local model resident in RAM between candles. Only ever sent on the
+  tier-0 call; later (presumably cloud) tiers never receive it.
+- `ESCALATION_SHARE_LOCAL_ANSWER` behavior is unchanged in spirit but now
+  applies uniformly to every tier past tier 0, not just a single cloud hop.
+- Trade log events renamed/extended for the chain: `escalation` and
+  `escalation_failed` events now carry a `tier` index and `model` name
+  instead of a `provider` name; the `signal` event gains an
+  `escalation_tier` field.
+
+## 9.1
+
 Added local openai compatible gateway for LLM
 New parameters for using are in .env file
 

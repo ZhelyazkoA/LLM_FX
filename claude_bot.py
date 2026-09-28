@@ -1,5 +1,38 @@
 """
-Claude Bot (v9.0)
+Claude Bot (v9.2)
+
+v9.2 changes (llmspy gateway - see CHANGELOG.md for the full history):
+  - Both the "local" signal and every escalation step now go through a
+    single OpenAI-chat-completions-compatible gateway (llmspy), reached at
+    LLMSPY_BASE_URL. llmspy itself decides whether a given model name is
+    served locally (Ollama) or by a cloud backend - this file no longer
+    talks to Ollama's native /api/generate endpoint or a hardcoded list of
+    cloud providers (Groq/Cerebras/OpenRouter + their API keys are gone).
+  - The old two-stage "local model, then ONE cloud fallback chain" design
+    is replaced by an ordered chain of any length: LLMSPY_MODELS is a
+    comma-separated list (tier 0 first, e.g. "phi4-mini,gpt-oss-20b,...").
+    Tier 0 is tried first; if its confidence is below
+    ESCALATION_CONFIDENCE_THRESHOLD, later tiers are tried IN ORDER and the
+    first one to return a valid answer is used as-is (matches the old
+    cloud-escalation semantics, just generalized past a single hop). A tier
+    that errors or times out falls through to the next; if every later tier
+    fails, tier 0's answer is used regardless of its low confidence.
+  - The whole chain for one candle is bounded by the existing per-timeframe
+    MAX_LLM_LATENCY_SEC budget (unchanged table); each individual call
+    within that chain is additionally capped by LLMSPY_TIMEOUT_SEC (or
+    whatever's left of the overall budget, if less).
+  - Ollama-only tuning (OLLAMA_NUM_THREAD, OLLAMA_NUM_CTX, OLLAMA_MODEL
+    auto-detection via /api/ps + /api/tags) is removed - llmspy's chat-
+    completions endpoint does not forward a nested Ollama "options" object,
+    so num_ctx/num_thread have no effect from here and must be configured
+    on the llmspy/Ollama side instead. OLLAMA_NUM_PREDICT is replaced by
+    LLMSPY_MAX_TOKENS, sent as the standard `max_tokens` field (confirmed
+    to work through llmspy). KEEP_LOCAL_ALIVE (minutes) is new: sent as
+    Ollama's `keep_alive` field, tier 0 only, confirmed to pass through
+    llmspy and extend how long Ollama keeps the local model loaded in RAM.
+  - API keys (GROQ_API_KEY etc.) are gone: llmspy is the only thing that
+    ever authenticates outward, so claude_bot.py no longer holds any
+    provider credentials.
 
 v8 changes from v7 (folded into this version - see below for v9):
   1. TIMESTAMP FIX: the "Recent bars" shown to the LLM used
@@ -37,14 +70,14 @@ trading rules, output-format contract - identical every candle) and a
 per-candle user prompt (market state/bars only), sent via proper
 system/user roles to both the local Ollama model and every cloud provider.
 
-Cloud escalation (kept): when the local Ollama model returns a confidence
-below CFG.escalation_confidence_threshold, the daemon escalates the same
-market context to a cloud LLM (Groq/Cerebras/OpenRouter, tried in order)
-for a second opinion. Both the local and cloud answers are written to the
-trade log as an "escalation" event; the FINAL trade decision uses the
-cloud model's action/confidence whenever escalation produced a usable
-answer, and falls back to the local model's answer if every provider
-fails.
+Cloud escalation (kept, generalized in v9.2): when tier 0's confidence
+comes back below CFG.escalation_confidence_threshold, the daemon escalates
+the same market context to the next model(s) in LLMSPY_MODELS, in order,
+for a second opinion - all through the same llmspy gateway. Both the
+tier-0 answer and the escalation answer are written to the trade log as an
+"escalation" event; the FINAL trade decision uses the escalation model's
+action/confidence whenever escalation produced a usable answer, and falls
+back to tier 0's own answer if every later tier fails.
 
 Magic number is configurable via MAGIC_NUMBER (default 260922, changed from
 v8's 260921 alongside this rename/rewrite - see the v9 note below on why
@@ -138,7 +171,7 @@ except ImportError:
         print("[!] MetaTrader5 package not found in this prefix.")
         sys.exit(1)
 
-__version__ = "9.0"
+__version__ = "9.2"
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -148,12 +181,13 @@ BASE_DIR = Path(__file__).resolve().parent
 # ============================================================
 @dataclass
 class Config:
-    # ---- MT5 / Ollama connection ----
-    # Hostname (or IP) of the machine running Ollama. Your MT5/wine box
-    # calls out to this over HTTP; it does not need to be the same machine.
-    truenas_ip: str = os.getenv("TRUENAS_IP", "localhost")
-    # TCP port Ollama is listening on at truenas_ip.
-    ollama_port: int = int(os.getenv("OLLAMA_PORT", "11434"))
+    # ---- llmspy gateway ----
+    # llmspy is the single OpenAI-chat-completions-compatible endpoint this
+    # bot talks to for EVERY model call (local or cloud) - it decides
+    # internally whether a given model name below is served by a local
+    # Ollama instance or a cloud backend. No default hostname is baked in
+    # here (see the v9.0 note on personal defaults) - set this in .env.
+    llmspy_base_url: str = os.getenv("LLMSPY_BASE_URL", "http://localhost:8000/v1/chat/completions")
 
     # ---- Instrument ----
     # MT5 symbol name exactly as your broker lists it (e.g. "EURUSD",
@@ -235,22 +269,33 @@ class Config:
     # yet (e.g. insufficient candle history) so there's still some guard.
     max_spread_pips: float = 2.5
 
-    # ---- Cloud escalation ----
-    # Master on/off switch. False = the local Ollama answer is always
-    # final, cloud providers are never called regardless of confidence.
+    # ---- Escalation chain (all tiers go through llmspy) ----
+    # Ordered, comma-separated model names - tier 0 first. llmspy decides
+    # per-model whether that name resolves to a local or cloud backend, so
+    # this list is the ONLY place tier order is configured. A single entry
+    # means no escalation is possible even if escalation_enabled is true.
+    llmspy_models: tuple = tuple(
+        m.strip() for m in os.getenv("LLMSPY_MODELS", "phi4-mini,gpt-oss-20b").split(",")
+        if m.strip()
+    )
+    # Master on/off switch. False = tier 0's answer is always final, later
+    # tiers in llmspy_models are never called regardless of confidence.
     escalation_enabled: bool = os.getenv("ESCALATION_ENABLED", "true").lower() == "true"
-    # If the local model's confidence comes back BELOW this, escalate to
-    # the cloud provider chain for a second opinion. Independent from
-    # min_confidence below, which is the final entry filter applied to
-    # whichever answer (local or cloud) ends up being used.
+    # If tier 0's confidence comes back BELOW this, escalate to the next
+    # tier(s) in llmspy_models, in order, for a second opinion. Independent
+    # from min_confidence below, which is the final entry filter applied to
+    # whichever answer (tier 0 or an escalated tier) ends up being used.
     escalation_confidence_threshold: float = float(os.getenv("ESCALATION_CONFIDENCE_THRESHOLD", "0.70"))
-    # Default per-provider HTTP timeout (seconds) for cloud escalation
-    # calls, used whenever a provider doesn't set its own *_TIMEOUT_SEC.
-    cloud_timeout_sec: int = int(os.getenv("CLOUD_TIMEOUT_SEC", "20"))
-    # false (default) = the cloud model sees only the market state and forms
-    # an INDEPENDENT opinion (avoids anchoring on a weak local answer).
-    # true = the local model's action/confidence/reasoning is appended to the
-    # cloud prompt (see build_escalation_user_prompt).
+    # HTTP timeout (seconds) applied to EACH individual call in the chain,
+    # tier 0 and every escalation tier alike - a shared value rather than
+    # per-provider, since llmspy is the only endpoint now. If less time
+    # remains in this candle's overall MAX_LLM_LATENCY_SEC budget than this
+    # value, the remaining budget is used instead (see get_trade_decision).
+    llmspy_timeout_sec: int = int(os.getenv("LLMSPY_TIMEOUT_SEC", "40"))
+    # false (default) = an escalation tier sees only the market state and
+    # forms an INDEPENDENT opinion (avoids anchoring on a weak tier-0
+    # answer). true = tier 0's action/confidence/reasoning is appended to
+    # the prompt for every later tier (see build_escalation_user_prompt).
     escalation_share_local_answer: bool = os.getenv(
         "ESCALATION_SHARE_LOCAL_ANSWER", "false").lower() == "true"
 
@@ -328,14 +373,21 @@ class Config:
     # real risk-based sizing.
     fixed_lot_override: float = float(os.getenv("FIXED_LOT_SIZE", "0") or "0")
 
-    # ---- Ollama inference tuning (matters most on constrained/no-GPU hardware) ----
-    # Number of CPU threads Ollama uses for local inference.
-    ollama_num_thread: int = int(os.getenv("OLLAMA_NUM_THREAD", "3"))
-    # Context window size (tokens) given to the local model.
-    ollama_num_ctx: int = int(os.getenv("OLLAMA_NUM_CTX", "2048"))
-    # Max tokens the local model is allowed to generate per response. The
-    # expected JSON answer is short, so this can stay small.
-    ollama_num_predict: int = int(os.getenv("OLLAMA_NUM_PREDICT", "128"))
+    # ---- Generation limits ----
+    # Max tokens ANY tier is allowed to generate per response, sent as the
+    # standard `max_tokens` chat-completions field (confirmed to pass
+    # through llmspy to the underlying model). The expected JSON answer is
+    # short, so this can stay small. NOTE: num_ctx/num_thread are NOT
+    # configurable from here - llmspy's chat-completions endpoint does not
+    # forward a nested Ollama `options` object, so those must be set on the
+    # llmspy/Ollama side directly.
+    llmspy_max_tokens: int = int(os.getenv("LLMSPY_MAX_TOKENS", "128"))
+    # Minutes to keep the LOCAL (tier 0) model loaded in RAM between calls,
+    # sent as Ollama's `keep_alive` field (e.g. 10 -> "10m") - confirmed to
+    # pass through llmspy. Only applied to the tier-0 call; later
+    # (presumably cloud) tiers never receive it. 0 (default) = omit the
+    # field entirely and let Ollama use its own default (~5 minutes).
+    keep_local_alive_min: int = int(os.getenv("KEEP_LOCAL_ALIVE", "0") or "0")
 
     # ---- Timeframe selection ----
     # Which candle timeframe to trade: M1 | M5 | M15 | M30 | H1 | H4. Drives
@@ -358,95 +410,20 @@ class Config:
 
 
 CFG = Config()
-OLLAMA_BASE_URL = f"http://{CFG.truenas_ip}:{CFG.ollama_port}"
 
 # ============================================================
-# CLOUD ESCALATION PROVIDERS
+# ESCALATION CHAIN SANITY CHECK
 # ============================================================
-# Each entry is {"name", "api_key", "base_url", "model", "timeout"}. base_url
-# must be an OpenAI-chat-completions-compatible endpoint (POST {base_url} with
-# {"model", "messages", ...} -> choices[0].message.content) - that's what
-# call_cloud_provider() below speaks, so most free-tier providers (Groq,
-# Cerebras, OpenRouter, Together, Fireworks, ...) drop in unmodified.
-#
-# Providers are tried IN ORDER; the first one that returns a valid JSON
-# signal wins. Groq, Cerebras, and OpenRouter are wired in below - each only
-# activates if its API key env var is set, so leaving a key blank simply
-# skips that provider. To add a fourth provider later, append another dict
-# here in the same shape, e.g.:
-#   if os.getenv("TOGETHER_API_KEY"):
-#       CLOUD_PROVIDERS.append({
-#           "name": "together",
-#           "api_key": os.getenv("TOGETHER_API_KEY"),
-#           "base_url": os.getenv("TOGETHER_BASE_URL", "https://api.together.xyz/v1/chat/completions"),
-#           "model": os.getenv("TOGETHER_MODEL", "meta-llama/Llama-3.3-70B-Instruct-Turbo-Free"),
-#           "timeout": int(os.getenv("TOGETHER_TIMEOUT_SEC", str(CFG.cloud_timeout_sec))),
-#       })
-CLOUD_PROVIDERS: list[dict] = []
-
-
-def _extra_params(prefix: str) -> dict:
-    """Optional provider-specific request fields, given as a JSON object in
-    <PREFIX>_EXTRA_PARAMS, merged into the chat-completions payload as-is.
-    Example: GROQ_EXTRA_PARAMS='{"reasoning_effort": "low"}' (check your
-    provider's docs for accepted fields/values)."""
-    raw = os.getenv(f"{prefix}_EXTRA_PARAMS", "").strip()
-    if not raw:
-        return {}
-    try:
-        val = json.loads(raw)
-        if isinstance(val, dict):
-            return val
-        print(f"[!] {prefix}_EXTRA_PARAMS must be a JSON object - ignoring.")
-    except json.JSONDecodeError as e:
-        print(f"[!] {prefix}_EXTRA_PARAMS is not valid JSON ({e}) - ignoring.")
-    return {}
-
-if os.getenv("LOCALCLOUD_ENABLED", "true").lower() == "true":
-    CLOUD_PROVIDERS.append({
-        "name": "localproxy",
-        "api_key": os.getenv("LOCALCLOUD_API_KEY", "not-needed"),
-        "base_url": os.getenv("LOCALCLOUD_BASE_URL", "http://localhost:11074/v1/chat/completions"),
-        "model": os.getenv("LOCALCLOUD_MODEL", "openai/gpt-oss-20b"),
-        "timeout": int(os.getenv("LOCALCLOUD_TIMEOUT_SEC", str(CFG.cloud_timeout_sec))),
-        "extra_params": _extra_params("LOCALCLOUD"),
-    })
-if os.getenv("GROQ_API_KEY"):
-    CLOUD_PROVIDERS.append({
-        "name": "groq",
-        "api_key": os.getenv("GROQ_API_KEY"),
-        "base_url": os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1/chat/completions"),
-        "model": os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
-        "timeout": int(os.getenv("GROQ_TIMEOUT_SEC", str(CFG.cloud_timeout_sec))),
-        "extra_params": _extra_params("GROQ"),
-    })
-
-if os.getenv("CEREBRAS_API_KEY"):
-    CLOUD_PROVIDERS.append({
-        "name": "cerebras",
-        "api_key": os.getenv("CEREBRAS_API_KEY"),
-        "base_url": os.getenv("CEREBRAS_BASE_URL", "https://api.cerebras.ai/v1/chat/completions"),
-        "model": os.getenv("CEREBRAS_MODEL", "llama3.1-8b"),
-        "timeout": int(os.getenv("CEREBRAS_TIMEOUT_SEC", str(CFG.cloud_timeout_sec))),
-        "extra_params": _extra_params("CEREBRAS"),
-    })
-
-if os.getenv("OPENROUTER_API_KEY"):
-    CLOUD_PROVIDERS.append({
-        "name": "openrouter",
-        "api_key": os.getenv("OPENROUTER_API_KEY"),
-        "base_url": os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1/chat/completions"),
-        "model": os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free"),
-        "timeout": int(os.getenv("OPENROUTER_TIMEOUT_SEC", str(CFG.cloud_timeout_sec))),
-        "extra_params": _extra_params("OPENROUTER"),
-    })
-
-# --- Add future free-tier providers above this line, same dict shape ---
-
-if CFG.escalation_enabled and not CLOUD_PROVIDERS:
-    print("[!] ESCALATION_ENABLED=true but no cloud provider API keys were found "
-          "(e.g. GROQ_API_KEY). Low-confidence local signals will just fall through "
-          "to the local model's own answer.")
+# There is no separate provider list anymore (v9.2): every tier in
+# CFG.llmspy_models is reached through the same llmspy gateway, which
+# decides internally whether that model name is local or cloud. Escalation
+# just means "try the next name in the list".
+if not CFG.llmspy_models:
+    print("[!] LLMSPY_MODELS is empty - every signal will fall back to HOLD.")
+elif CFG.escalation_enabled and len(CFG.llmspy_models) < 2:
+    print(f"[!] ESCALATION_ENABLED=true but LLMSPY_MODELS only has one entry "
+          f"({CFG.llmspy_models[0]!r}) - low-confidence tier-0 signals have nowhere "
+          f"to escalate to and will just be used as-is.")
 
 # Candle length + LLM response budget per timeframe. The budget is a ceiling,
 # not a target: while a signal request is in flight, trailing-stop management
@@ -500,31 +477,6 @@ def log_event(record: dict):
             f.write(json.dumps(record, default=str) + "\n")
     except OSError as e:
         print(f"[!] Could not write trade log: {e}")
-
-
-# ============================================================
-# OLLAMA MODEL RESOLUTION
-# ============================================================
-def get_active_model(base_url: str) -> str:
-    if env_model := os.getenv("OLLAMA_MODEL"):
-        return env_model
-    try:
-        res = requests.get(f"{base_url}/api/ps", timeout=3)
-        if res.status_code == 200:
-            models = res.json().get("models", [])
-            if models:
-                return models[0]["name"]
-    except requests.RequestException:
-        pass
-    try:
-        res = requests.get(f"{base_url}/api/tags", timeout=3)
-        if res.status_code == 200:
-            installed = res.json().get("models", [])
-            if installed:
-                return installed[0]["name"]
-    except requests.RequestException:
-        pass
-    return "qwen2.5:3b"
 
 
 # ============================================================
@@ -807,137 +759,39 @@ def pick_filling_mode(symbol_info) -> int:
     return mt5.ORDER_FILLING_RETURN
 
 
-def generate_trade_signal(ctx: dict) -> dict:
-    model_name = get_active_model(OLLAMA_BASE_URL)
-    user_prompt = build_user_prompt(ctx)
-
-    print(f"[*] Using model: {model_name}")
-
-    print("\n" + "=" * 15 + " [THE QUESTION] " + "=" * 15)
-    print("--- system ---")
-    print(SYSTEM_PROMPT)
-    print("--- user ---")
-    print(user_prompt)
-    print("\n" + "=" * 48 + "\n")
-
+def call_llmspy_model(model: str, system_prompt: str, user_prompt: str,
+                       timeout_sec: float, keep_alive_min: int = 0) -> dict:
+    """POSTs a single OpenAI-chat-completions-style request to llmspy for
+    `model`. llmspy alone decides whether that name is served locally
+    (Ollama) or by a cloud backend - this function neither knows nor cares
+    which. Raises on any failure (network, HTTP, malformed JSON) so the
+    caller (get_trade_decision) can fall through to the next tier."""
     payload = {
-        "model": model_name,
-        "system": SYSTEM_PROMPT,
-        "prompt": user_prompt,
-        "format": {
-            "type": "object",
-                "properties": {
-                "reasoning": {"type": "string"},
-                "action": {"type": "string", "enum": ["BUY", "SELL", "HOLD"]},
-                "confidence": {"type": "number"}
-                },
-        "required": ["reasoning", "action", "confidence"]
-        },
-        "stream": False,
-        "options": {
-            "temperature": 0.1,
-            "num_predict": CFG.ollama_num_predict,
-            "num_ctx": CFG.ollama_num_ctx,
-            "num_thread": CFG.ollama_num_thread,
-        },
-    }
-
-    t0 = time.perf_counter()
-    try:
-        res = requests.post(f"{OLLAMA_BASE_URL}/api/generate", json=payload,
-                             timeout=(5, MAX_LLM_LATENCY_SEC))
-        res.raise_for_status()
-        latency = time.perf_counter() - t0
-        raw_response = res.json().get("response", "").strip()
-
-        print("\n" + "=" * 15 + " [RAW LLM ANSWER] " + "=" * 15)
-        print(raw_response)
-        print(f"[*] Response Time: {latency:.2f} seconds")
-        print("=" * 48 + "\n")
-
-        result = parse_llm_json(raw_response)
-        if "action" not in result:
-            print(f"[!] Malformed LLM response, missing 'action' key: {result}")
-            result = {"action": "HOLD", "confidence": 0.0, "reasoning": f"Malformed: {result}"}
-        result = normalize_signal(result)
-        result["latency_sec"] = round(latency, 2)
-        result["model"] = model_name
-        return result
-
-    except requests.exceptions.Timeout:
-        latency = time.perf_counter() - t0
-        err_msg = f"Ollama request timed out (>{MAX_LLM_LATENCY_SEC}s budget for {CFG.trade_timeframe})."
-        print(f"[!] {err_msg}")
-        return {"action": "HOLD", "confidence": 0.0, "reasoning": err_msg,
-                "latency_sec": round(latency, 2), "model": model_name}
-
-    except (requests.RequestException, ValueError) as e:      # ValueError includes JSONDecodeError
-        latency = time.perf_counter() - t0
-        print(f"[!] LLM Request Error: {e}")
-        return {"action": "HOLD", "confidence": 0.0, "reasoning": str(e),
-                "latency_sec": round(latency, 2), "model": model_name}
-
-    except Exception as e:
-        latency = time.perf_counter() - t0
-        print(f"[!] LLM Generation Error after {latency:.2f}s: {e}")
-        return {"action": "HOLD", "confidence": 0.0, "reasoning": str(e),
-                "latency_sec": round(latency, 2), "model": model_name}
-
-
-# ============================================================
-# CLOUD ESCALATION
-# ============================================================
-def build_escalation_user_prompt(ctx: dict, local_result: dict) -> str:
-    """Same per-candle market state as the local user prompt, plus the local
-    model's own (low-confidence) answer, framed as a request for an
-    independent second opinion rather than a rubber stamp. SYSTEM_PROMPT
-    (persona/rules/output-format) is sent separately via the system role -
-    it is NOT repeated here."""
-    base = build_user_prompt(ctx)
-    return base + f"""
-
-A smaller local model already reviewed this exact setup and returned:
-- action: {local_result.get('action')}
-- confidence: {local_result.get('confidence')}
-- reasoning: {local_result.get('reasoning')}
-
-Its confidence ({local_result.get('confidence')}) was below the escalation
-threshold ({CFG.escalation_confidence_threshold}), so you are being consulted
-as a stronger second opinion. Independently evaluate the market state above -
-you may agree or disagree with the local model's action."""
-
-
-def call_cloud_provider(provider: dict, system_prompt: str, user_prompt: str) -> dict:
-    """POSTs an OpenAI-chat-completions-style request. Raises on any failure
-    (network, HTTP, malformed JSON) so the caller can fall through to the
-    next configured provider."""
-    headers = {
-        "Authorization": f"Bearer {provider['api_key']}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": provider["model"],
+        "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
         "temperature": 0.1,
+        "max_tokens": CFG.llmspy_max_tokens,
         "response_format": {"type": "json_object"},
     }
-    payload.update(provider.get("extra_params") or {})
+    if keep_alive_min:
+        # Ollama-native field, confirmed to pass through llmspy. Only ever
+        # sent for the tier-0 (local) call - see get_trade_decision.
+        payload["keep_alive"] = f"{keep_alive_min}m"
 
     def _post(body: dict):
-        return requests.post(provider["base_url"], headers=headers, json=body,
-                             timeout=provider.get("timeout", CFG.cloud_timeout_sec))
+        return requests.post(CFG.llmspy_base_url, json=body, timeout=(5, timeout_sec))
 
+    print(f"[*] Requesting signal from '{model}' (timeout {timeout_sec:.0f}s)...")
     t0 = time.perf_counter()
     res = _post(payload)
-    # Some (mostly free-tier) models reject JSON mode outright. Retry once
-    # without it - parse_llm_json() copes with plain-text JSON anyway.
+    # Some models reject JSON mode outright. Retry once without it -
+    # parse_llm_json() copes with plain-text JSON anyway.
     if (res.status_code == 400 and "response_format" in payload
             and "response_format" in res.text.lower()):
-        print(f"[!] Provider '{provider['name']}' rejected response_format - "
-              f"retrying once without JSON mode.")
+        print(f"[!] Model '{model}' rejected response_format - retrying once without JSON mode.")
         payload.pop("response_format")
         res = _post(payload)
     if not res.ok:
@@ -952,99 +806,137 @@ def call_cloud_provider(provider: dict, system_prompt: str, user_prompt: str) ->
         )
 
     latency = time.perf_counter() - t0
-
     raw = (res.json()["choices"][0]["message"].get("content") or "").strip()
+
+    print("\n" + "=" * 15 + f" [RAW ANSWER: {model}] " + "=" * 15)
+    print(raw)
+    print(f"[*] Response Time: {latency:.2f} seconds")
+    print("=" * 48 + "\n")
+
     result = parse_llm_json(raw)
     if "action" not in result:
-        raise ValueError(f"Malformed cloud response, missing 'action' key: {result}")
+        raise ValueError(f"Malformed response from '{model}', missing 'action' key: {result}")
     result = normalize_signal(result)
-
     result["latency_sec"] = round(latency, 2)
-    result["model"] = provider["model"]
-    result["provider"] = provider["name"]
+    result["model"] = model
     return result
 
 
-def escalate_to_cloud(ctx: dict, local_result: dict):
-    """Tries each configured cloud provider in order. Logs the escalation
-    (local answer + cloud answer) on success, and logs failures per provider
-    so the trade log shows exactly what was tried. Returns the first
-    successful cloud signal dict, or None if every provider failed / none
-    are configured."""
-    if CFG.escalation_share_local_answer:
-        user_prompt = build_escalation_user_prompt(ctx, local_result)
-    else:
-        user_prompt = build_user_prompt(ctx)
+def build_escalation_user_prompt(ctx: dict, tier0_result: dict) -> str:
+    """Same per-candle market state as the normal user prompt, plus tier
+    0's own (low-confidence) answer, framed as a request for an independent
+    second opinion rather than a rubber stamp. SYSTEM_PROMPT (persona/
+    rules/output-format) is sent separately via the system role - it is
+    NOT repeated here. Only used when ESCALATION_SHARE_LOCAL_ANSWER=true."""
+    base = build_user_prompt(ctx)
+    return base + f"""
 
-    for provider in CLOUD_PROVIDERS:
-        try:
-            print(f"[*] Local confidence {local_result.get('confidence')} < "
-                  f"{CFG.escalation_confidence_threshold} - escalating to cloud "
-                  f"provider '{provider['name']}' ({provider['model']})...")
-            cloud_result = call_cloud_provider(provider, SYSTEM_PROMPT, user_prompt)
-            print(f"[+] Cloud provider '{provider['name']}' answered: "
-                  f"{cloud_result.get('action')} (Conf: {cloud_result.get('confidence')}) "
-                  f"in {cloud_result.get('latency_sec')}s")
+An earlier tier in the escalation chain already reviewed this exact setup
+and returned:
+- action: {tier0_result.get('action')}
+- confidence: {tier0_result.get('confidence')}
+- reasoning: {tier0_result.get('reasoning')}
 
-            log_event({
-                "event": "escalation",
-                "provider": provider["name"],
-                "cloud_model": provider["model"],
-                "reason": f"local confidence {local_result.get('confidence')} < "
-                          f"threshold {CFG.escalation_confidence_threshold}",
-                "local_signal": local_result,
-                "cloud_signal": cloud_result,
-            })
-            return cloud_result
-
-        except Exception as e:   # any provider failure must fall through to the next one
-            print(f"[!] Cloud provider '{provider['name']}' failed: {type(e).__name__}: {e}")
-            log_event({
-                "event": "escalation_failed",
-                "provider": provider["name"],
-                "cloud_model": provider.get("model"),
-                "error_type": type(e).__name__,
-                "error": str(e),
-                "local_signal": local_result,
-            })
-            continue
-
-    print("[!] All cloud providers failed or none configured - keeping local signal.")
-    log_event({
-        "event": "escalation_exhausted",
-        "reason": "no cloud provider produced a usable answer",
-        "local_signal": local_result,
-    })
-    return None
+Its confidence ({tier0_result.get('confidence')}) was below the escalation
+threshold ({CFG.escalation_confidence_threshold}), so you are being consulted
+as a stronger second opinion. Independently evaluate the market state above -
+you may agree or disagree with the earlier tier's action."""
 
 
 def get_trade_decision(ctx: dict) -> dict:
-    """Entry point submitted to the background executor. Runs the local
-    model first; if its confidence is below the escalation threshold, asks
-    the cloud provider chain for a second opinion and uses THAT answer as
-    the final decision (falling back to the local answer if escalation is
-    disabled, unconfigured, or every provider failed)."""
-    local_result = generate_trade_signal(ctx)
-    local_result["source"] = "local"
+    """Entry point submitted to the background executor. Walks
+    CFG.llmspy_models in order:
+      - Tier 0 is tried first. If its confidence >= the escalation
+        threshold (or escalation is disabled / there's nowhere to
+        escalate to), its answer is final.
+      - Otherwise later tiers are tried in order; the FIRST ONE to return
+        a valid answer is used as-is (its own confidence is not re-checked
+        - it's trusted as a stronger second opinion, same as the old
+        single-hop cloud escalation). A tier that errors or times out
+        falls through to the next.
+      - If every later tier fails, tier 0's (low-confidence) answer is
+        used as the final fallback.
+    The whole chain is bounded by this timeframe's MAX_LLM_LATENCY_SEC
+    budget: each call is capped at min(LLMSPY_TIMEOUT_SEC, time remaining
+    in that budget), and no further tier is attempted once the budget is
+    exhausted."""
+    deadline = time.time() + MAX_LLM_LATENCY_SEC
+    user_prompt = build_user_prompt(ctx)
+    models = CFG.llmspy_models
+    tier0_result = None
 
-    if not CFG.escalation_enabled:
-        return local_result
+    for i, model in enumerate(models):
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            print(f"[!] LLM decision budget ({MAX_LLM_LATENCY_SEC}s) exhausted before "
+                  f"trying '{model}' (tier {i}).")
+            break
+        call_timeout = max(1.0, min(CFG.llmspy_timeout_sec, remaining))
+        keep_alive = CFG.keep_local_alive_min if i == 0 else 0
+        tier_prompt = (build_escalation_user_prompt(ctx, tier0_result)
+                        if i > 0 and CFG.escalation_share_local_answer and tier0_result
+                        else user_prompt)
 
-    confidence = local_result.get("confidence", 0.0) or 0.0
-    if confidence >= CFG.escalation_confidence_threshold:
-        return local_result
+        try:
+            result = call_llmspy_model(model, SYSTEM_PROMPT, tier_prompt, call_timeout, keep_alive)
+        except requests.exceptions.Timeout:
+            err_msg = f"'{model}' (tier {i}) timed out after {call_timeout:.0f}s."
+            print(f"[!] {err_msg}")
+            if i == 0:
+                tier0_result = {"action": "HOLD", "confidence": 0.0, "reasoning": err_msg,
+                                 "model": model, "source": "tier0"}
+            else:
+                log_event({"event": "escalation_failed", "tier": i, "model": model,
+                           "error_type": "Timeout", "error": err_msg, "tier0_signal": tier0_result})
+            continue
+        except Exception as e:
+            print(f"[!] '{model}' (tier {i}) failed: {type(e).__name__}: {e}")
+            if i == 0:
+                tier0_result = {"action": "HOLD", "confidence": 0.0, "reasoning": str(e),
+                                 "model": model, "source": "tier0"}
+            else:
+                log_event({"event": "escalation_failed", "tier": i, "model": model,
+                           "error_type": type(e).__name__, "error": str(e),
+                           "tier0_signal": tier0_result})
+            continue
 
-    if not CLOUD_PROVIDERS:
-        return local_result
+        if i == 0:
+            result["source"] = "tier0"
+            tier0_result = result
+            confidence = result.get("confidence", 0.0) or 0.0
+            if (confidence >= CFG.escalation_confidence_threshold
+                    or not CFG.escalation_enabled or len(models) < 2):
+                return result
+            print(f"[*] Tier 0 ('{model}') confidence {confidence} < "
+                  f"{CFG.escalation_confidence_threshold} - escalating to next tier.")
+        else:
+            result["source"] = "escalation"
+            result["tier"] = i
+            result["escalated_from_action"] = tier0_result.get("action") if tier0_result else None
+            result["escalated_from_confidence"] = tier0_result.get("confidence") if tier0_result else None
+            print(f"[+] Tier {i} ('{model}') answered: {result.get('action')} "
+                  f"(Conf: {result.get('confidence')}) in {result.get('latency_sec')}s")
+            log_event({
+                "event": "escalation", "tier": i, "model": model,
+                "reason": f"tier 0 confidence {tier0_result.get('confidence') if tier0_result else None} "
+                          f"< threshold {CFG.escalation_confidence_threshold}",
+                "tier0_signal": tier0_result, "escalation_signal": result,
+            })
+            return result
 
-    cloud_result = escalate_to_cloud(ctx, local_result)
-    if cloud_result is None:
-        return local_result
-
-    cloud_result["source"] = "cloud"
-    cloud_result["escalated_from_action"] = local_result.get("action")
-    cloud_result["escalated_from_confidence"] = local_result.get("confidence")
-    return cloud_result
+    print("[!] Escalation chain exhausted without a usable higher-tier answer - "
+          "keeping tier-0 signal.")
+    if tier0_result is None:
+        tier0_result = {"action": "HOLD", "confidence": 0.0,
+                         "reasoning": "No tier in the chain produced any answer.",
+                         "model": models[0] if models else "none", "source": "tier0"}
+    else:
+        log_event({
+            "event": "escalation_exhausted",
+            "reason": "no later tier produced a usable answer",
+            "tier0_signal": tier0_result,
+        })
+    return tier0_result
 
 
 # ============================================================
@@ -1563,6 +1455,10 @@ def run_daemon():
     print(f"=== Daemon Claude v{__version__} Started for {CFG.symbol} | Mode: {mode} | "
           f"Timeframe: {CFG.trade_timeframe} | LLM budget: {MAX_LLM_LATENCY_SEC}s | "
           f"Checking every {CFG.check_interval_sec}s ===")
+    print(f"[*] llmspy gateway: {CFG.llmspy_base_url}")
+    print(f"[*] Model chain: {' -> '.join(CFG.llmspy_models) or '(none configured)'} "
+          f"| Escalation: {'on' if CFG.escalation_enabled else 'off'} "
+          f"(threshold {CFG.escalation_confidence_threshold}) | Per-call timeout: {CFG.llmspy_timeout_sec}s")
 
     last_candle_time = get_current_candle_opentime(CFG.symbol, TIMEFRAME)
 
@@ -1605,10 +1501,11 @@ def run_daemon():
                 except Exception as e:
                     signal_data = {"action": "HOLD", "confidence": 0.0,
                                     "reasoning": f"Worker thread error: {e}"}
-                source = signal_data.get("source", "local")
+                source = signal_data.get("source", "tier0")
                 escalation_note = ""
-                if source == "cloud":
-                    escalation_note = (f" [escalated from local {signal_data.get('escalated_from_action')} "
+                if source == "escalation":
+                    escalation_note = (f" [tier {signal_data.get('tier')}, escalated from "
+                                        f"{signal_data.get('escalated_from_action')} "
                                         f"@ {signal_data.get('escalated_from_confidence')}]")
                 print(f"\n[+] Decision (after {elapsed:.1f}s) from {source} model "
                       f"'{signal_data.get('model', 'unknown')}': {signal_data.get('action')} "
@@ -1623,6 +1520,7 @@ def run_daemon():
                     "reasoning": signal_data.get("reasoning"),
                     "latency_sec": signal_data.get("latency_sec"),
                     "decision_elapsed_sec": round(elapsed, 1),
+                    "escalation_tier": signal_data.get("tier"),
                     "escalated_from_action": signal_data.get("escalated_from_action"),
                     "escalated_from_confidence": signal_data.get("escalated_from_confidence"),
                     "market": {k: pending_ctx.get(k) for k in (
