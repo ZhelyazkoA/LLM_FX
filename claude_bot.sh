@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# Claude Trading Daemon - launch script (v9.2, llmspy gateway)
+# Claude Trading Daemon - launch script (v9.3, llmspy gateway)
 # ============================================================
 # Configuration lives in a local `.env` file (copy .env.example -> .env and
 # edit). Every variable below can also be provided by the calling
@@ -64,6 +64,9 @@ export MAGIC_NUMBER="${MAGIC_NUMBER:-260922}"         # changing it orphans open
 
 # Position / risk
 export MAX_POSITIONS_PER_DIRECTION="${MAX_POSITIONS_PER_DIRECTION:-1}"
+export MIN_ENTRY_GAP_MIN="${MIN_ENTRY_GAP_MIN:-30}"         # min minutes between same-direction entries (0 = off)
+export BLOCK_OPPOSITE_SIDE="${BLOCK_OPPOSITE_SIDE:-true}"   # no BUY while SELLs are open and vice versa
+export MAX_SPREAD_ATR_RATIO="${MAX_SPREAD_ATR_RATIO:-0.35}"
 export FIXED_LOT_SIZE="${FIXED_LOT_SIZE:-0.01}"       # 0 = risk-% based sizing
 export DRY_RUN="${DRY_RUN:-true}"                     # true = never send orders
 export MIN_CONFIDENCE="${MIN_CONFIDENCE:-0.75}"
@@ -74,12 +77,13 @@ export DAILY_LOSS_LIMIT_PCT="${DAILY_LOSS_LIMIT_PCT:-3.0}"
 
 # Candle / indicator lookback
 export LOOKBACK_CANDLES="${LOOKBACK_CANDLES:-50}"     # must stay >= 22
-export PROMPT_BARS="${PROMPT_BARS:-3}"
+export PROMPT_BARS="${PROMPT_BARS:-8}"
+export PROMPT_INCLUDE_POSITIONS="${PROMPT_INCLUDE_POSITIONS:-false}"
 
 # Generation limits (num_ctx/num_thread are NOT settable here - llmspy
 # doesn't forward Ollama's nested "options" object; configure those on the
 # llmspy/Ollama side directly)
-export LLMSPY_MAX_TOKENS="${LLMSPY_MAX_TOKENS:-128}"
+export LLMSPY_MAX_TOKENS="${LLMSPY_MAX_TOKENS:-1500}"
 export KEEP_LOCAL_ALIVE="${KEEP_LOCAL_ALIVE:-0}"         # minutes; 0 = Ollama's own default (~5m)
 export LLM_MAX_LATENCY_SEC="${LLM_MAX_LATENCY_SEC:-0}"   # 0 = per-timeframe budget table
 
@@ -92,12 +96,14 @@ export MAX_TP_EXTENSION_ATR_MULT="${MAX_TP_EXTENSION_ATR_MULT:-10.0}"
 # Chandelier Exit trailing stop
 export TRAIL_ACTIVATION_ATR_MULT="${TRAIL_ACTIVATION_ATR_MULT:-1.5}"
 export CHANDELIER_ATR_MULT="${CHANDELIER_ATR_MULT:-3.0}"
+export TRAIL_SL_MIN_STEP_ATR_FRACTION="${TRAIL_SL_MIN_STEP_ATR_FRACTION:-0.1}"
 
 # Escalation chain - ordered, comma-separated model names, tier 0 first.
 # llmspy decides per-model whether that name is local or cloud; no API keys
 # are needed here anymore, llmspy is the only thing that authenticates outward.
-export LLMSPY_MODELS="${LLMSPY_MODELS:-phi4-mini,gpt-oss-20b}"
+export LLMSPY_MODELS="${LLMSPY_MODELS:-gpt-oss-20b}"
 export ESCALATION_ENABLED="${ESCALATION_ENABLED:-true}"
+export ESCALATION_MODE="${ESCALATION_MODE:-replace}"      # replace | confirm
 export ESCALATION_CONFIDENCE_THRESHOLD="${ESCALATION_CONFIDENCE_THRESHOLD:-0.80}"
 export ESCALATION_SHARE_LOCAL_ANSWER="${ESCALATION_SHARE_LOCAL_ANSWER:-false}"
 export LLMSPY_TIMEOUT_SEC="${LLMSPY_TIMEOUT_SEC:-40}"    # same timeout applied to every tier call

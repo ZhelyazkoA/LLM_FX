@@ -1,5 +1,23 @@
 """
-Claude Bot (v9.2)
+Claude Bot (v9.3)
+
+v9.3 changes (from the log analysis of v9.2 - see CHANGELOG.md):
+  - ESCALATION_MODE (new). "replace" (default) = v9.2 behaviour: a tier-0
+    answer below ESCALATION_CONFIDENCE_THRESHOLD is replaced by the next
+    tier's answer (both are written to the log, so models can be compared).
+    "confirm" = tier 0 decides; the next tier is only consulted when tier 0
+    is about to TRADE (BUY/SELL and confidence >= MIN_CONFIDENCE) and acts
+    as a veto (disagreement -> HOLD; agreement -> confidence = min of both).
+  - Position/daily-P&L lines removed from the prompt by default
+    (PROMPT_INCLUDE_POSITIONS=false); the bot cannot act on "hold/close".
+    SYSTEM_PROMPT now states BUY/SELL open a new position, HOLD = no trade.
+  - New entry filters: BLOCK_OPPOSITE_SIDE (no hedging), MIN_ENTRY_GAP_MIN
+    (spacing between same-direction entries), MAX_SPREAD_ATR_RATIO now env.
+  - Trailing SL step is ATR-scaled (TRAIL_SL_MIN_STEP_ATR_FRACTION) instead
+    of 1 pip, fewer broker modify requests.
+  - Audit log: new trade_opened (position ticket, ATR, RSI, HTF), trade_closed
+    now has position_id/reason/price, new position_peak (watermark at close),
+    signal.market now has last_close/ema9/ema21 for offline evaluation.
 
 v9.2 changes (llmspy gateway - see CHANGELOG.md for the full history):
   - Both the "local" signal and every escalation step now go through a
@@ -171,7 +189,7 @@ except ImportError:
         print("[!] MetaTrader5 package not found in this prefix.")
         sys.exit(1)
 
-__version__ = "9.2"
+__version__ = "9.3"
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -264,7 +282,7 @@ class Config:
     # so the same ratio makes sense whether the instrument is EURUSD (spread
     # measured in fractions of a pip) or something like ETHUSD (spread
     # measured in whole dollars) - a fixed pip number wouldn't generalize.
-    max_spread_atr_ratio: float = 0.35
+    max_spread_atr_ratio: float = float(os.getenv("MAX_SPREAD_ATR_RATIO", "0.35"))
     # Fallback spread filter (in pips), used ONLY if ATR isn't available
     # yet (e.g. insufficient candle history) so there's still some guard.
     max_spread_pips: float = 2.5
@@ -285,7 +303,7 @@ class Config:
     # tier(s) in llmspy_models, in order, for a second opinion. Independent
     # from min_confidence below, which is the final entry filter applied to
     # whichever answer (tier 0 or an escalated tier) ends up being used.
-    escalation_confidence_threshold: float = float(os.getenv("ESCALATION_CONFIDENCE_THRESHOLD", "0.70"))
+    escalation_confidence_threshold: float = float(os.getenv("ESCALATION_CONFIDENCE_THRESHOLD", "0.80"))
     # HTTP timeout (seconds) applied to EACH individual call in the chain,
     # tier 0 and every escalation tier alike - a shared value rather than
     # per-provider, since llmspy is the only endpoint now. If less time
@@ -298,6 +316,17 @@ class Config:
     # the prompt for every later tier (see build_escalation_user_prompt).
     escalation_share_local_answer: bool = os.getenv(
         "ESCALATION_SHARE_LOCAL_ANSWER", "false").lower() == "true"
+    # "replace" (default) = low-confidence tier 0 is replaced by the next
+    # tier's answer (v9.2 behaviour). "confirm" = tier 0 decides, the next
+    # tier only vetoes/confirms a candidate trade (threshold is not used).
+    escalation_mode: str = os.getenv("ESCALATION_MODE", "replace").strip().lower()
+    # true = prompt also contains open-position counts and daily P&L.
+    prompt_include_positions: bool = os.getenv("PROMPT_INCLUDE_POSITIONS", "false").lower() == "true"
+    # true = refuse a BUY while SELLs are open (and vice versa): no hedging.
+    block_opposite_side: bool = os.getenv("BLOCK_OPPOSITE_SIDE", "true").lower() == "true"
+    # Minimum minutes since the newest open position in the SAME direction
+    # before another one may be opened. 0 = off.
+    min_entry_gap_min: float = float(os.getenv("MIN_ENTRY_GAP_MIN", "30"))
 
     # ---- Trade entry filter ----
     # Minimum confidence (whichever model's answer is actually used, local
@@ -357,6 +386,9 @@ class Config:
     # on nearly every upward tick and the bot would hammer the broker with
     # SLTP modifications every few seconds.
     tp_update_min_atr_fraction: float = 0.25
+    # Minimum SL improvement (fraction of ATR, never below 1 pip) before a
+    # trailing-stop modify request is sent.
+    trail_sl_min_step_atr_fraction: float = float(os.getenv("TRAIL_SL_MIN_STEP_ATR_FRACTION", "0.1"))
     # Fallback Chandelier distance (pips), used only if ATR is unavailable.
     chandelier_fallback_pips: int = 30
 
@@ -659,6 +691,9 @@ def fetch_dynamic_context(symbol: str, timeframe=TIMEFRAME):
         "atr_pips": atr_pips,
         "rsi14": rsi_val,
         "ema9_vs_ema21": ema_trend,
+        "ema9": ema9,
+        "ema21": ema21,
+        "last_close": closes[-1],
         "recent_bars": compact_bars,
     }
 
@@ -676,6 +711,7 @@ SYSTEM_PROMPT = f"""You are a disciplined intraday forex analyst. Provide your r
 Rules:
 - Prefer trading in the direction of the higher-timeframe bias, but a counter-trend BUY or SELL is allowed when the trade timeframe's own price action/momentum clearly contradicts the bias - don't discard a valid counter-trend setup just because it opposes the higher-timeframe bias.
 - Widen skepticism (lower confidence) if spread is elevated relative to ATR.
+- BUY or SELL opens a NEW position; HOLD means no new trade. You cannot close or manage existing positions.
 - You decide direction and conviction only. Do not propose stop-loss or take-profit levels; risk is handled separately.
 
 {OUTPUT_FORMAT_INSTRUCTION}"""
@@ -686,6 +722,10 @@ def build_user_prompt(ctx: dict) -> str:
     that's all in SYSTEM_PROMPT, sent once via the system role."""
     pos = ctx.get("open_position") or "none"
     tz_label = bar_timezone_label()
+    extra = ""
+    if CFG.prompt_include_positions:
+        extra = (f"\n- Open positions for this strategy: {pos}"
+                 f"\n- Today's realized P&L so far: {ctx.get('daily_pnl_pct')}%")
     return f"""Analyze {ctx['symbol']} on {ctx['timeframe']}.
 
 Market state:
@@ -694,9 +734,7 @@ Market state:
 - ATR(14): {ctx.get('atr_pips')} pips
 - RSI(14): {ctx.get('rsi14')}
 - EMA9 vs EMA21 ({ctx['timeframe']}): {ctx.get('ema9_vs_ema21')}
-- {HTF_TIMEFRAME_NAME} trend bias: {ctx.get('htf_bias')}
-- Open positions for this strategy: {pos}
-- Today's realized P&L so far: {ctx.get('daily_pnl_pct')}%
+- {HTF_TIMEFRAME_NAME} trend bias: {ctx.get('htf_bias')}{extra}
 
 Recent {ctx['timeframe']} bars (Date-Time [{tz_label}]|Open|High|Low|Close), oldest first.
 The last bar below is the most recent FULLY CLOSED candle (the still-forming current candle is intentionally excluded):
@@ -776,6 +814,9 @@ def call_llmspy_model(model: str, system_prompt: str, user_prompt: str,
         "max_tokens": CFG.llmspy_max_tokens,
         "response_format": {"type": "json_object"},
     }
+    # For debbuging 
+    #print(f"Payload \n {payload} \n")
+
     if keep_alive_min:
         # Ollama-native field, confirmed to pass through llmspy. Only ever
         # sent for the tier-0 (local) call - see get_trade_decision.
@@ -903,6 +944,40 @@ def get_trade_decision(ctx: dict) -> dict:
         if i == 0:
             result["source"] = "tier0"
             tier0_result = result
+            if CFG.escalation_mode == "confirm" and CFG.escalation_enabled and len(models) > 1:
+                # Confirm mode: only spend a second call when tier 0 wants to trade.
+                if result["action"] == "HOLD" or result["confidence"] < CFG.min_confidence:
+                    return result
+                for j in range(1, len(models)):
+                    left = deadline - time.time()
+                    if left <= 0:
+                        break
+                    m2 = models[j]
+                    try:
+                        second = call_llmspy_model(
+                            m2, SYSTEM_PROMPT, user_prompt,
+                            max(1.0, min(CFG.llmspy_timeout_sec, left)))
+                    except Exception as e:
+                        print(f"[!] Confirm tier {j} ('{m2}') failed: {type(e).__name__}: {e}")
+                        log_event({"event": "escalation_failed", "tier": j, "model": m2,
+                                   "error_type": type(e).__name__, "error": str(e),
+                                   "tier0_signal": result})
+                        continue
+                    log_event({"event": "confirmation", "tier": j, "model": m2,
+                               "tier0_signal": result, "confirm_signal": second})
+                    if second["action"] != result["action"]:
+                        print(f"[*] Tier {j} ('{m2}') VETO: {second['action']} "
+                              f"(Conf {second['confidence']}) vs {result['action']}.")
+                        return {**result, "action": "HOLD", "confidence": 0.0,
+                                "source": "vetoed",
+                                "reasoning": f"Vetoed by {m2} ({second['action']} "
+                                             f"@ {second['confidence']}): {second.get('reasoning', '')}"}
+                    print(f"[+] Tier {j} ('{m2}') confirmed {result['action']} "
+                          f"(Conf {second['confidence']}).")
+                    result["confidence"] = min(result["confidence"], second["confidence"])
+                    return result
+                print("[!] No confirming tier answered - keeping tier-0 signal unconfirmed.")
+                return result
             confidence = result.get("confidence", 0.0) or 0.0
             if (confidence >= CFG.escalation_confidence_threshold
                     or not CFG.escalation_enabled or len(models) < 2):
@@ -1064,6 +1139,7 @@ class RiskManager:
         extremes = self.state["position_extremes"]
         stale = [k for k in extremes if int(k) not in open_tickets]
         for k in stale:
+            log_event({"event": "position_peak", "ticket": int(k), "extreme_price": extremes[k]})
             del extremes[k]
         if stale:
             self.save()
@@ -1102,6 +1178,8 @@ def sync_closed_trades(risk_mgr: RiskManager, symbol: str, magic: int):
         net = (deal.profit + getattr(deal, "commission", 0.0) + getattr(deal, "swap", 0.0))
         risk_mgr.record_trade_result(net)
         log_event({"event": "trade_closed", "ticket": deal.ticket,
+                   "position_id": getattr(deal, "position_id", None),
+                   "reason": getattr(deal, "reason", None), "price": getattr(deal, "price", None),
                    "profit": deal.profit, "commission": getattr(deal, "commission", 0.0),
                    "swap": getattr(deal, "swap", 0.0), "net": net})
         new_max = max(new_max, deal.ticket)
@@ -1223,6 +1301,8 @@ def apply_dynamic_trailing_stop(symbol: str, magic: int, risk_mgr: RiskManager):
         max_tp_dist = None
         tp_min_step = 0.0
 
+    sl_min_step = max(pip_size, (atr_price or 0.0) * CFG.trail_sl_min_step_atr_fraction)
+
     # Prune watermark entries for any ticket that's no longer open (closed,
     # stopped out, etc.) before processing this iteration's live positions.
     open_tickets = {pos.ticket for pos in positions if pos.magic == magic}
@@ -1249,7 +1329,7 @@ def apply_dynamic_trailing_stop(symbol: str, magic: int, risk_mgr: RiskManager):
             new_tp = (mark + extended_tp_dist) if extended_tp_dist else pos.tp
             if max_tp_dist:
                 new_tp = min(new_tp, pos.price_open + max_tp_dist)
-            sl_improved = ((pos.sl == 0.0 or new_sl > pos.sl + pip_size)
+            sl_improved = ((pos.sl == 0.0 or new_sl > pos.sl + sl_min_step)
                            and new_sl < mark - min_gap)
             tp_improved = bool(extended_tp_dist) and (pos.tp == 0.0 or new_tp > pos.tp + tp_min_step)
         else:
@@ -1257,7 +1337,7 @@ def apply_dynamic_trailing_stop(symbol: str, magic: int, risk_mgr: RiskManager):
             new_tp = (mark - extended_tp_dist) if extended_tp_dist else pos.tp
             if max_tp_dist:
                 new_tp = max(new_tp, pos.price_open - max_tp_dist)
-            sl_improved = ((pos.sl == 0.0 or new_sl < pos.sl - pip_size)
+            sl_improved = ((pos.sl == 0.0 or new_sl < pos.sl - sl_min_step)
                            and new_sl > mark + min_gap)
             tp_improved = bool(extended_tp_dist) and (pos.tp == 0.0 or new_tp < pos.tp - tp_min_step)
 
@@ -1302,11 +1382,30 @@ def execute_protected_trade(signal_data: dict, ctx: dict, risk_mgr: RiskManager)
               f"on {symbol} (max {CFG.max_positions_per_direction}).")
         return False
 
+    if CFG.block_opposite_side:
+        opp = "SELL" if action == "BUY" else "BUY"
+        opp_open = count_open_positions_in_direction(symbol, opp, CFG.magic_number)
+        if opp_open > 0:
+            print(f"[*] Execution blocked: {opp_open} open {opp} position(s) - "
+                  f"not opening a hedging {action}.")
+            return False
+
     symbol_info = mt5.symbol_info(symbol)
     tick = mt5.symbol_info_tick(symbol)
     if not symbol_info or not tick:
         print("[!] Symbol info or tick unavailable.")
         return False
+
+    if CFG.min_entry_gap_min > 0:
+        want = mt5.POSITION_TYPE_BUY if action == "BUY" else mt5.POSITION_TYPE_SELL
+        same = [p for p in (mt5.positions_get(symbol=symbol) or [])
+                if p.magic == CFG.magic_number and p.type == want]
+        if same:
+            age_min = (tick.time - max(p.time for p in same)) / 60.0
+            if age_min < CFG.min_entry_gap_min:
+                print(f"[*] Execution blocked: newest {action} is only {age_min:.0f} min old "
+                      f"(min gap {CFG.min_entry_gap_min:g} min).")
+                return False
 
     point = symbol_info.point
     digits = symbol_info.digits
@@ -1425,6 +1524,11 @@ def execute_protected_trade(signal_data: dict, ctx: dict, risk_mgr: RiskManager)
     print(f"[+] Order Executed! Ticket #{result.order} | {action} {lot_size} Lots {symbol} | "
           f"Entry: {price} | SL: {sl} | TP: {tp} | Risk tier: {risk_mgr.state['tier']} "
           f"({risk_mgr.risk_pct():.2f}%)")
+    log_event({"event": "trade_opened", "ticket": result.order, "action": action,
+               "confidence": confidence, "lot": lot_size, "price": price, "sl": sl, "tp": tp,
+               "atr_pips": ctx.get("atr_pips"), "rsi14": ctx.get("rsi14"),
+               "htf_bias": ctx.get("htf_bias"), "session": ctx.get("session"),
+               "spread_pips": spread_pips, "model": signal_data.get("model")})
     return True
 
 
@@ -1458,7 +1562,7 @@ def run_daemon():
     print(f"[*] llmspy gateway: {CFG.llmspy_base_url}")
     print(f"[*] Model chain: {' -> '.join(CFG.llmspy_models) or '(none configured)'} "
           f"| Escalation: {'on' if CFG.escalation_enabled else 'off'} "
-          f"(threshold {CFG.escalation_confidence_threshold}) | Per-call timeout: {CFG.llmspy_timeout_sec}s")
+          f"(threshold {CFG.escalation_confidence_threshold}, mode {CFG.escalation_mode}) | Per-call timeout: {CFG.llmspy_timeout_sec}s")
 
     last_candle_time = get_current_candle_opentime(CFG.symbol, TIMEFRAME)
 
@@ -1525,7 +1629,8 @@ def run_daemon():
                     "escalated_from_confidence": signal_data.get("escalated_from_confidence"),
                     "market": {k: pending_ctx.get(k) for k in (
                         "symbol", "timeframe", "spread_pips", "atr_pips", "rsi14",
-                        "ema9_vs_ema21", "htf_bias", "session")},
+                        "ema9_vs_ema21", "htf_bias", "session",
+                        "last_close", "ema9", "ema21")},
                 })
                 if halted:
                     print("[*] Daily circuit breaker is active - not opening a new trade "
